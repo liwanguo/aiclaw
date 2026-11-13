@@ -70,6 +70,14 @@ jobs:
               exit 1
               ;;
           esac
+          # 只接受 host[:port]。带协议/路径/空格会被脚本拼成 https://https//...，host 变成 "https"，
+          # 导致 82 个检测请求全部失败后再 exit 2，报错极为隐晦。
+          case "${DOMAIN}" in
+            *://*|*/*|*" "*)
+              echo "::error::DOMAIN 格式错误：只能填 Worker 的 host，例如 ai.aiclaw.de5.net。不要带 https://、不要带 /check 路径、不要有空格。当前值：${DOMAIN}"
+              exit 1
+              ;;
+          esac
           echo "检测域名已配置：${DOMAIN}"
 
       - name: Run pipeline
