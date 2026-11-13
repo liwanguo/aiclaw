@@ -54,35 +54,56 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Validate worker secret
+        id: domain
         env:
           DOMAIN: ${{ secrets.DOMAIN }}
         run: |
           set -eu
           if [ -z "${DOMAIN}" ]; then
-            echo "::error::未配置检测地址。请在仓库 Settings → Secrets and variables → Actions 中新增 Secret：DOMAIN（只填 Worker 的 host，例如 abc.workers.dev）"
+            echo "::error::未配置检测地址。请在仓库 Settings → Secrets and variables → Actions 中新增 Secret：DOMAIN（只填 Worker 的 host，例如 ai.aiclaw.de5.net）"
             exit 1
           fi
-          # 与 vpngate.py 的 PLACEHOLDER_MARKERS 保持一致，提前拦住占位符，避免脚本内 exit 2。
+
+          # 与 vpngate.py 的 PLACEHOLDER_MARKERS 保持一致
           low=$(printf '%s' "${DOMAIN}" | tr '[:upper:]' '[:lower:]')
           case "${low}" in
             *你的*|*your_*|*your-*|*example.com*|*yourdomain*)
-              echo "::error::DOMAIN 仍是占位符。请在 Settings → Secrets 把 DOMAIN 改成真实的 Worker host（例如 abc.workers.dev），不要带 https:// 或路径。"
+              echo "::error::DOMAIN 仍是占位符，请改成真实的 Worker host（例如 ai.aiclaw.de5.net）"
               exit 1
               ;;
           esac
-          # 只接受 host[:port]。带协议/路径/空格会被脚本拼成 https://https//...，host 变成 "https"，
-          # 导致 82 个检测请求全部失败后再 exit 2，报错极为隐晦。
-          case "${DOMAIN}" in
-            *://*|*/*|*" "*)
-              echo "::error::DOMAIN 格式错误：只能填 Worker 的 host，例如 ai.aiclaw.de5.net。不要带 https://、不要带 /check 路径、不要有空格。当前值：${DOMAIN}"
+
+          # 宽容解析：允许带 http(s):// 前缀（大小写无关）和尾部斜杠，先归一化再校验
+          host="${DOMAIN}"
+          lowhost=$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')
+          case "${lowhost}" in
+            http://*)  host="${host:7}" ;;
+            https://*) host="${host:8}" ;;
+          esac
+          host="${host%/}"
+
+          # 归一化后仍含路径/参数/空格 → 非法（例如 https//xxx 少冒号、或带 /check）
+          case "${host}" in
+            */*|*"?"*|*"#"*|*" "*)
+              echo "::error::DOMAIN 格式错误：只能是 Worker 的 host，例如 ai.aiclaw.de5.net。可以带 https://，但不能带 /check 路径、查询参数、空格，也不能是 https//（少冒号）这种残缺协议。"
               exit 1
               ;;
           esac
-          echo "检测域名已配置：${DOMAIN}"
+
+          case "${host}" in
+            *.*) ;;
+            *)
+              echo "::error::DOMAIN 不是完整域名：${host}（缺少点号，应形如 ai.aiclaw.de5.net）"
+              exit 1
+              ;;
+          esac
+
+          echo "host=${host}" >> "$GITHUB_OUTPUT"
+          echo "检测域名已配置：${host}"
 
       - name: Run pipeline
         env:
-          CHECK_WORKER: ${{ secrets.DOMAIN }}
+          CHECK_WORKER: ${{ steps.domain.outputs.host }}
           CHECK_CONCURRENCY: ${{ github.event.inputs.concurrency || '32' }}
           CHECK_TIMEOUT: ${{ github.event.inputs.timeout || '25' }}
           MAX_CHECK_NODES: ${{ github.event.inputs.max_nodes || '0' }}
