@@ -73,22 +73,20 @@ jobs:
               ;;
           esac
 
-          # 宽容解析：允许带 http(s):// 前缀（大小写无关）和尾部斜杠，先归一化再校验
-          host="${DOMAIN}"
-          lowhost=$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')
-          case "${lowhost}" in
-            http://*)  host="${host:7}" ;;
-            https://*) host="${host:8}" ;;
-          esac
-          host="${host%/}"
+          # 宽容解析：从任意粘贴形式中抽出 host，用户无需手改 Secret。
+          # 支持：ai.aiclaw.de5.net / https://ai.aiclaw.de5.net
+          #       https://ai.aiclaw.de5.net/check?sstp=vpn:vpn@
+          #       以及 https//（少冒号）这类残缺写法
+          raw=$(printf '%s' "${DOMAIN}" | tr -d '\r\n')
+          raw=$(printf '%s' "${raw}" | sed -E 's|^[[:space:]]+||; s|[[:space:]]+$||')
+          raw=$(printf '%s' "${raw}" | sed -E 's|^(https?)//|\1://|I')
+          host=$(printf '%s' "${raw}" | sed -E 's|^[A-Za-z][A-Za-z0-9+.-]*://||; s|[/?#].*$||')
+          host="${host%.}"
 
-          # 归一化后仍含路径/参数/空格 → 非法（例如 https//xxx 少冒号、或带 /check）
-          case "${host}" in
-            */*|*"?"*|*"#"*|*" "*)
-              echo "::error::DOMAIN 格式错误：只能是 Worker 的 host，例如 ai.aiclaw.de5.net。可以带 https://，但不能带 /check 路径、查询参数、空格，也不能是 https//（少冒号）这种残缺协议。"
-              exit 1
-              ;;
-          esac
+          if ! printf '%s' "${host}" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$'; then
+            echo "::error::无法从 DOMAIN 解析出合法 host（得到 ${host}）。请填 ai.aiclaw.de5.net 这种形式。"
+            exit 1
+          fi
 
           case "${host}" in
             *.*) ;;
