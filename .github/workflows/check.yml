@@ -34,17 +34,18 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # 固定到 24.04：ubuntu-latest 将于 2026-10-19 迁移到 Ubuntu 26，锁版本可避免届时突发破坏性变更。
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: pip
@@ -56,10 +57,19 @@ jobs:
         env:
           DOMAIN: ${{ secrets.DOMAIN }}
         run: |
+          set -eu
           if [ -z "${DOMAIN}" ]; then
             echo "::error::未配置检测地址。请在仓库 Settings → Secrets and variables → Actions 中新增 Secret：DOMAIN（只填 Worker 的 host，例如 abc.workers.dev）"
             exit 1
           fi
+          # 与 vpngate.py 的 PLACEHOLDER_MARKERS 保持一致，提前拦住占位符，避免脚本内 exit 2。
+          low=$(printf '%s' "${DOMAIN}" | tr '[:upper:]' '[:lower:]')
+          case "${low}" in
+            *你的*|*your_*|*your-*|*example.com*|*yourdomain*)
+              echo "::error::DOMAIN 仍是占位符。请在 Settings → Secrets 把 DOMAIN 改成真实的 Worker host（例如 abc.workers.dev），不要带 https:// 或路径。"
+              exit 1
+              ;;
+          esac
           echo "检测域名已配置：${DOMAIN}"
 
       - name: Run pipeline
@@ -112,16 +122,16 @@ jobs:
           exit 1
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: public
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
       - name: Show site URL
         run: |
