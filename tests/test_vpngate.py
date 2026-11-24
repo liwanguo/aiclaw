@@ -100,6 +100,30 @@ def test_normalize_endpoint(raw, expected):
     assert vpngate.normalize_endpoint(raw) == expected
 
 
+def test_parse_extra_sources_defaults_and_filters():
+    assert vpngate.parse_extra_sources("") == vpngate.DEFAULT_EXTRA_SOURCES
+
+    parsed = vpngate.parse_extra_sources(
+        "http=https://a.example/list.txt, socks5=http://b.example/s.txt, ftp=x, bad, "
+        "HTTP=https://a.example/list.txt, socks5=http://b.example/s.txt"
+    )
+    assert parsed == (
+        ("http", "https://a.example/list.txt"),
+        ("socks5", "http://b.example/s.txt"),
+    )
+
+
+def test_interleave_keeps_extra_sources_when_truncated():
+    primary = [vpngate.Node(f"p{i}", 443, f"10.0.0.{i}", "Japan", "JP") for i in range(5)]
+    secondary = [vpngate.Node(f"s{i}", 8080, f"10.1.0.{i}", "US", "US", protocol="http") for i in range(3)]
+
+    merged = vpngate.interleave(primary, secondary)
+
+    assert [n.host for n in merged] == ["p0", "s0", "p1", "s1", "p2", "s2", "p3", "p4"]
+    # 交错后即使按前 4 条截断，额外源也已有代表
+    assert merged[3].protocol == "http"
+
+
 def test_parse_edge_hosts_dedupes_and_skips_invalid():
     result = vpngate.parse_edge_hosts("a.com:443, a.com:443, b.com:8443, bad host")
     assert result == ["a.com:443", "b.com:8443"]

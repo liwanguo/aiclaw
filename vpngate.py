@@ -339,9 +339,11 @@ class Config:
     min_success_ratio: float
     max_residential_per_country: int
     max_datacenter_per_country: int
-    enable_extra_sources: bool
-    extra_sources: tuple[tuple[str, str], ...]
-    extra_max_nodes: int
+    # 额外代理源（http/socks5 等）。给默认值是为了让外部直接构造 Config 的调用保持兼容；
+    # Config.load() 仍会按环境变量覆盖这几项。
+    enable_extra_sources: bool = True
+    extra_sources: tuple[tuple[str, str], ...] = ()
+    extra_max_nodes: int = 120
 
     @classmethod
     def load(cls) -> "Config":

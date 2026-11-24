@@ -101,9 +101,11 @@ def prepare_env(monkeypatch, base: str, public_dir, **extra):
     monkeypatch.setenv("CHECK_DEADLINE", "60")
     monkeypatch.setenv("HTTP_TIMEOUT", "5")
     monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    # 额外代理源会真实访问互联网，集成测试里关闭，保证用本地假服务器即可复现。
+    monkeypatch.setenv("ENABLE_EXTRA_SOURCES", "0")
     for key, value in extra.items():
         monkeypatch.setenv(key, value)
-    for key in ("DOMAIN", "MAX_CHECK_NODES", "MIN_SUCCESS_RATIO"):
+    for key in ("DOMAIN", "MAX_CHECK_NODES", "MIN_SUCCESS_RATIO", "EXTRA_PROXY_SOURCES", "EXTRA_MAX_NODES"):
         if key not in extra:
             monkeypatch.delenv(key, raising=False)
 
