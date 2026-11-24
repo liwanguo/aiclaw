@@ -317,7 +317,7 @@ def derive_nodes_url() -> str:
     if "/" in repo:
         owner, name = repo.split("/", 1)
         if owner and name:
-            return f"https://liwanguo.github.io/aiclaw/nodes.txt"
+            return f"https://{owner}.github.io/{name}/nodes.txt"
     return "https://liwanguo.github.io/aiclaw/nodes.txt"
 
 
