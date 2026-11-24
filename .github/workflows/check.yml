@@ -45,7 +45,7 @@ jobs:
     timeout-minutes: 30
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deploy1.outputs.page_url || steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -162,8 +162,20 @@ jobs:
         with:
           path: public
 
-      - name: Deploy to GitHub Pages
+      # 兜底：GitHub 偶发“产物元数据延迟注册”——upload 步骤成功、产物在 REST API 也能查到，
+      # 但 deploy-pages 在同一秒去查询时返回 Found 0 artifact(s)，导致部署失败（同一 commit 重跑常能成功）。
+      # 这里先等待让产物元数据在 Actions 结果服务中可见，并在失败时自动再部署一次。
+      - name: Wait for artifact registration
+        run: sleep 15
+
+      - name: Deploy to GitHub Pages (attempt 1)
+        id: deploy1
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+
+      - name: Deploy to GitHub Pages (retry)
         id: deployment
+        if: steps.deploy1.outcome == 'failure'
         uses: actions/deploy-pages@v5
 
       - name: Show site URL
