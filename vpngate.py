@@ -95,6 +95,21 @@ RESIDENTIAL_ORG_KEYWORDS = [
     "BREEZE", "TIM S.P.A", "LIBERO", "FASTWEB", "FREE FRANCE", "BT OPEN",
 ]
 
+DEFAULT_EXCLUDE_COUNTRIES = frozenset({"CN"})
+
+
+def parse_exclude_countries(raw: str | None) -> frozenset[str]:
+    """解析要排除的出口国家/地区代码（逗号/分号分隔）。
+
+    - 环境变量未设置（None）：使用默认值，排除中国大陆（CN）。
+    - 显式设为空字符串：表示不排除任何国家/地区。
+    """
+    if raw is None:
+        return DEFAULT_EXCLUDE_COUNTRIES
+    normalized = raw.replace(";", ",").replace("，", ",")
+    return frozenset(code.strip().upper() for code in normalized.split(",") if code.strip())
+
+
 COUNTRY_ZH = {
     "JP": "日本", "KR": "韩国", "US": "美国", "CA": "加拿大", "RU": "俄罗斯",
     "RO": "罗马尼亚", "TH": "泰国", "VN": "越南", "DE": "德国", "FR": "法国",
@@ -344,6 +359,8 @@ class Config:
     enable_extra_sources: bool = True
     extra_sources: tuple[tuple[str, str], ...] = ()
     extra_max_nodes: int = 120
+    # 要从结果里剔除的出口国家/地区代码（默认排除中国大陆，见 DEFAULT_EXCLUDE_COUNTRIES）
+    exclude_country_codes: frozenset[str] = DEFAULT_EXCLUDE_COUNTRIES
 
     @classmethod
     def load(cls) -> "Config":
@@ -386,6 +403,7 @@ class Config:
             enable_extra_sources=enable_extra,
             extra_sources=extra_sources,
             extra_max_nodes=_env_int("EXTRA_MAX_NODES", 120),
+            exclude_country_codes=parse_exclude_countries(os.environ.get("EXCLUDE_COUNTRIES")),
         )
 
 
@@ -919,8 +937,13 @@ def build_outputs(
     worker_host: str,
     duration_s: float,
     timed_out: int,
+    exclude_country_codes: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
-    available = [r for r in results if r.get("success")]
+    def _code(item: dict[str, Any]) -> str:
+        return str(item.get("country_code") or "").upper()
+
+    available = [r for r in results if r.get("success") and _code(r) not in exclude_country_codes]
+    excluded = sum(1 for r in results if r.get("success") and _code(r) in exclude_country_codes)
     protocol_counts: dict[str, int] = {}
     for node in results:
         proto = str(node.get("protocol") or "sstp")
@@ -950,7 +973,8 @@ def build_outputs(
         "sstp_nodes": sstp_count,
         "checked": len(results),
         "success": len(available),
-        "failed": len(results) - len(available),
+        "excluded": excluded,
+        "failed": len(results) - len(available) - excluded,
         "worker_errors": sum(1 for r in results if r.get("worker_error")),
         "timed_out": timed_out,
         "countries": len(countries),
@@ -1090,6 +1114,8 @@ def main() -> None:
         f"额外源: {'开启' if cfg.enable_extra_sources else '关闭'}, "
         f"{len(cfg.extra_sources)} 个, 上限 {cfg.extra_max_nodes}",
     )
+    if cfg.exclude_country_codes:
+        log("CONFIG", f"排除出口国家/地区: {','.join(sorted(cfg.exclude_country_codes))}")
 
     rows, source = fetch_vpngate(cfg, session)
     raw_count = len(rows)
@@ -1149,7 +1175,17 @@ def main() -> None:
         worker_host=worker_host,
         duration_s=time.time() - started,
         timed_out=timed_out,
+        exclude_country_codes=cfg.exclude_country_codes,
     )
+
+    if data["stats"]["excluded"]:
+        log(
+            "RESULT",
+            f"已剔除 {data['stats']['excluded']} 个节点"
+            f"（出口国家/地区: {','.join(sorted(cfg.exclude_country_codes)) or '-'}）",
+        )
+    if data["stats"]["success"] == 0:
+        die("RESULT", "剔除指定国家/地区后没有可用节点，本次不发布（保留上一次产物）")
 
     edge_hosts = get_combined_edge_hosts(cfg, session)
     data_path, html_path, nodes_path, nodes_text = write_outputs(data, cfg, edge_hosts)

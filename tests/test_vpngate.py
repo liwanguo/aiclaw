@@ -100,6 +100,38 @@ def test_normalize_endpoint(raw, expected):
     assert vpngate.normalize_endpoint(raw) == expected
 
 
+def test_parse_exclude_countries_defaults_and_normalizes():
+    assert vpngate.parse_exclude_countries(None) == frozenset({"CN"})
+    assert vpngate.parse_exclude_countries("") == frozenset()
+    assert vpngate.parse_exclude_countries(" cn, hk ;tw，mo ") == frozenset({"CN", "HK", "TW", "MO"})
+
+
+def test_build_outputs_skips_excluded_country():
+    results = [
+        {"host": "a.opengw.net", "port": 443, "success": True, "country": "Japan", "country_code": "JP",
+         "residential": "residential", "latency_ms": 40, "worker_error": False},
+        {"host": "b.example.com", "port": 8080, "success": True, "country": "China", "country_code": "CN",
+         "residential": "datacenter", "latency_ms": 20, "worker_error": False, "protocol": "http"},
+        {"host": "c.example.com", "port": 8080, "success": False, "country": "China", "country_code": "CN",
+         "residential": "unknown", "latency_ms": None, "worker_error": True},
+    ]
+    data = vpngate.build_outputs(
+        results=results,
+        raw_count=3,
+        sstp_count=1,
+        source="test",
+        worker_host="worker.example.com",
+        duration_s=1.0,
+        timed_out=0,
+        exclude_country_codes=frozenset({"CN"}),
+    )
+    assert data["stats"]["success"] == 1
+    assert data["stats"]["excluded"] == 1
+    # 3 个检出：1 成功保留、1 按规则剔除、1 本身失败
+    assert data["stats"]["failed"] == 1
+    assert list(data["countries"]) == ["JP"]
+
+
 def test_parse_extra_sources_defaults_and_filters():
     assert vpngate.parse_extra_sources("") == vpngate.DEFAULT_EXTRA_SOURCES
 
