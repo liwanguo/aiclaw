@@ -72,6 +72,10 @@ on:
 | `CHECK_DEADLINE` | `1200` | 整轮检测的总截止时间（秒），超时未完成的节点按失败处理 |
 | `MAX_CHECK_NODES` | `0` | 最多检测多少个节点，`0` 表示全部；按 Ping 从低到高取 |
 | `MIN_SUCCESS_RATIO` | `0` | 成功率低于该比例时拒绝发布（0–1），`0` 表示不启用 |
+| `EXCLUDE_COUNTRIES` | `CN` | 从结果中剔除的出口国家/地区代码，逗号分隔（如 `CN,HK`）；设为空字符串表示不剔除 |
+| `ENABLE_EXTRA_SOURCES` | `1` | 是否接入额外代理源（http/socks5），用于增加覆盖的国家/地区数 |
+| `EXTRA_PROXY_SOURCES` | 内置 monosans 列表 | 额外源，格式 `proto=url,proto=url`，协议支持 `http` / `https` / `socks5` |
+| `EXTRA_MAX_NODES` | `120` | 额外源最多保留多少个节点（按交错顺序取样检查） |
 | `MAX_RESIDENTIAL_PER_COUNTRY` | `20` | 每个国家/地区写入 nodes.txt 的住宅节点上限 |
 | `MAX_DATACENTER_PER_COUNTRY` | `10` | 每个国家/地区写入 nodes.txt 的机房节点上限 |
 | `EDGE_HOSTS` / `HOSTS_ENTRY` | 内置池 | 自定义优选域名池，逗号分隔，可带端口，如 `a.com:443,b.com:8443` |
