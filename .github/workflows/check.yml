@@ -1,5 +1,6 @@
 name: VPN Gate Node Check
 
+# 私有仓库模式：检测结果上传为 Actions Artifact（nodes），不再发布 GitHub Pages。
 # 定时更新：已启用【北京时间每天 00:00】。
 # GitHub 的 cron 一律按 UTC 计算，北京时间 = UTC+8，故 00:00(北京) 对应 16:00(UTC)。
 # 常用时间对照（改下面 cron 即可）：
@@ -29,8 +30,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: gate-check
@@ -41,9 +40,6 @@ jobs:
     # 固定到 24.04：ubuntu-latest 将于 2026-10-19 迁移到 Ubuntu 26，锁版本可避免届时突发破坏性变更。
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -112,59 +108,16 @@ jobs:
           MIN_SUCCESS_RATIO: '0'
         run: python vpngate.py
 
-      - name: Ensure GitHub Pages is enabled
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -u
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/pages"
-          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
-
-          status=$(curl -sS -o /tmp/pages.json -w '%{http_code}' "${auth[@]}" "${api}")
-          echo "GET ${api} -> ${status}"
-
-          if [ "${status}" = "200" ]; then
-            echo "GitHub Pages 已启用"
-            exit 0
-          fi
-
-          if [ "${status}" = "404" ]; then
-            # 创建站点必须用 POST，且 workflow 构建类型不接受 source 字段
-            create=$(curl -sS -o /tmp/pages-create.json -w '%{http_code}' -X POST \
-              "${auth[@]}" -H "Content-Type: application/json" \
-              -d '{"build_type":"workflow"}' "${api}")
-            echo "POST ${api} -> ${create}"
-            case "${create}" in
-              201|204|409)
-                echo "GitHub Pages 已启用（或已存在），等待生效"
-                sleep 10
-                exit 0
-                ;;
-              *)
-                echo "::error::自动启用 Pages 失败（HTTP ${create}）。请打开仓库 Settings → Pages，把 Source 选为 GitHub Actions，然后重新运行本工作流。"
-                cat /tmp/pages-create.json 2>/dev/null || true
-                exit 1
-                ;;
-            esac
-          fi
-
-          echo "::error::查询 Pages 状态失败（HTTP ${status}），请检查仓库 Pages 设置或工作流权限。"
-          cat /tmp/pages.json 2>/dev/null || true
-          exit 1
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v6
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v5
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v4
         with:
-          path: public
+          name: nodes
+          path: public/
+          retention-days: 30
+          if-no-files-found: error
 
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5
-
-      - name: Show site URL
+      - name: Show artifact info
         run: |
-          echo "订阅地址：https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/nodes.txt"
-          echo "仪表盘：  https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+          echo "检测产物已上传为 Actions Artifact: nodes"
+          echo "下载方式: 打开本次运行页面 -> Artifacts -> nodes.zip"
+          echo "包含 public/nodes.txt, public/data.json, public/index.html"
