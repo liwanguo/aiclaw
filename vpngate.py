@@ -4,10 +4,11 @@
 流程:
   1. 抓取 VPN Gate 原始节点（官方 API，失败回退 GitHub 镜像）
   2. 只保留带 TCP 入口的 SSTP 节点（VPN Gate 的 TCP 端口即 SSTP 端口）
-  3. 去重 → 按 Ping 预排序 →（可选）截断
-  4. 并发调用检测 Worker
-  5. 合并静态优选域名与优选 API 端点
-  6. 生成 public/data.json + public/index.html + public/nodes.txt
+  3. 可选：抓取额外代理源（HTTP / SOCKS5），与 SSTP 节点合并去重
+  4. 去重 → 按 Ping 预排序、按协议交错 →（可选）截断
+  5. 并发调用检测 Worker（按节点协议分别拼 /check?协议= 参数）
+  6. 合并静态优选域名与优选 API 端点
+  7. 生成 public/data.json + public/index.html + public/nodes.txt
 
 配置全部来自环境变量。模板仓库约定：用户只需在仓库里配置 Secret `DOMAIN`，
 工作流会拼出检测地址；本地运行时可以直接设置 CHECK_WORKER。
@@ -52,6 +53,12 @@ DEFAULT_VPNGATE_MIRROR = (
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json"
 )
 DEFAULT_OPTIMAL_API = ""
+
+# 额外代理源：纯文本 IP:PORT 列表，每行一个。Worker 支持 http/socks5/https/turn/sstp。
+DEFAULT_EXTRA_SOURCES = (
+    ("http", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
+    ("socks5", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"),
+)
 
 # 占位符检测：命中任意一个就认为用户还没配置
 PLACEHOLDER_MARKERS = ("你的", "YOUR_", "YOUR-", "example.com", "yourdomain")
@@ -247,6 +254,49 @@ def normalize_endpoint(raw: str) -> str | None:
     return f"{host}:{port_number}"
 
 
+def split_endpoint(text: str) -> tuple[str, int] | None:
+    """把 normalize_endpoint 的输出拆成 (host, port)。"""
+    if text.startswith("["):
+        match = re.fullmatch(r"\[([^\]]+)\]:(\d{1,5})", text)
+        if not match:
+            return None
+        host, port = match.group(1), match.group(2)
+    else:
+        if ":" not in text:
+            return None
+        host, port = text.rsplit(":", 1)
+    try:
+        port_number = int(port)
+    except ValueError:
+        return None
+    if not 1 <= port_number <= 65535:
+        return None
+    return host, port_number
+
+
+def parse_extra_sources(raw: str) -> tuple[tuple[str, str], ...]:
+    """解析 `proto=url,proto=url`；空字符串返回默认源。"""
+    text = (raw or "").strip()
+    if not text:
+        return DEFAULT_EXTRA_SOURCES
+    result: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in text.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        proto, url = item.split("=", 1)
+        proto = proto.strip().lower()
+        url = url.strip()
+        if proto not in ("http", "https", "socks5", "turn", "sstp") or not url:
+            continue
+        key = f"{proto}|{url}"
+        if key not in seen:
+            seen.add(key)
+            result.append((proto, url))
+    return tuple(result)
+
+
 def parse_edge_hosts(raw: str) -> list[str]:
     endpoints: list[str] = []
     seen: set[str] = set()
@@ -289,6 +339,9 @@ class Config:
     min_success_ratio: float
     max_residential_per_country: int
     max_datacenter_per_country: int
+    enable_extra_sources: bool
+    extra_sources: tuple[tuple[str, str], ...]
+    extra_max_nodes: int
 
     @classmethod
     def load(cls) -> "Config":
@@ -305,6 +358,11 @@ class Config:
         edge_hosts = parse_edge_hosts(static_raw) if static_raw else []
         if not edge_hosts:
             edge_hosts = [h for h in (normalize_endpoint(x) for x in DEFAULT_EDGE_HOSTS) if h]
+
+        enable_extra = os.environ.get("ENABLE_EXTRA_SOURCES", "1").strip().lower() not in (
+            "0", "false", "no", "off", ""
+        )
+        extra_sources = parse_extra_sources(os.environ.get("EXTRA_PROXY_SOURCES", ""))
 
         return cls(
             vpngate_api=os.environ.get("VPNGATE_API", DEFAULT_VPNGATE_API),
@@ -323,6 +381,9 @@ class Config:
             min_success_ratio=_env_float("MIN_SUCCESS_RATIO", 0.0, minimum=0.0),
             max_residential_per_country=_env_int("MAX_RESIDENTIAL_PER_COUNTRY", 20),
             max_datacenter_per_country=_env_int("MAX_DATACENTER_PER_COUNTRY", 10),
+            enable_extra_sources=enable_extra,
+            extra_sources=extra_sources,
+            extra_max_nodes=_env_int("EXTRA_MAX_NODES", 120),
         )
 
 
@@ -496,6 +557,52 @@ def parse_mirror_json(data: Any) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# 额外代理源（HTTP / SOCKS5 等）
+# ---------------------------------------------------------------------------
+def fetch_extra_sources(cfg: Config, session: requests.Session) -> tuple[list[Node], list[str]]:
+    """从额外源抓取 IP:PORT 列表；返回 (节点列表, 源名称列表)。失败只记录、不中断。"""
+    if not cfg.enable_extra_sources:
+        return [], []
+    nodes: list[Node] = []
+    names: list[str] = []
+    seen: set[tuple[str, str, int]] = set()
+    for proto, url in cfg.extra_sources:
+        try:
+            log("EXTRA SOURCES", f"获取 {proto} 源: {url}")
+            resp = session.get(url, timeout=min(cfg.http_timeout, 30))
+            resp.raise_for_status()
+            count = 0
+            for line in resp.text.splitlines():
+                raw = line.split("#", 1)[0].strip()
+                # 额外源必须是明确的 host:port；避免把裸域名/注释当成 443 端口节点
+                if not re.search(r":\d{1,5}\s*$", raw):
+                    continue
+                endpoint = normalize_endpoint(raw)
+                if not endpoint:
+                    continue
+                split = split_endpoint(endpoint)
+                if not split:
+                    continue
+                host, port = split
+                key = (proto, host, port)
+                if key in seen:
+                    continue
+                seen.add(key)
+                ip = host if re.fullmatch(r"[0-9.]+", host) else ""
+                nodes.append(Node(host=host, port=port, ip=ip, country="", country_code="", protocol=proto))
+                count += 1
+            if count:
+                names.append(proto)
+            log("EXTRA SOURCES", f"{proto} 源获取 {count} 个节点")
+        except Exception as exc:  # noqa: BLE001
+            log("EXTRA SOURCES", f"{proto} 源获取失败: {exc}")
+    if cfg.extra_max_nodes > 0 and len(nodes) > cfg.extra_max_nodes:
+        nodes = nodes[: cfg.extra_max_nodes]
+    log("EXTRA SOURCES", f"合计 {len(nodes)} 个节点（上限 {cfg.extra_max_nodes}）")
+    return nodes, names
+
+
+# ---------------------------------------------------------------------------
 # 筛选 SSTP 节点
 # ---------------------------------------------------------------------------
 @dataclass
@@ -507,6 +614,7 @@ class Node:
     country_code: str
     ping: int | None = None
     score: int | None = None
+    protocol: str = "sstp"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -517,6 +625,7 @@ class Node:
             "country_code": self.country_code,
             "ping": self.ping,
             "score": self.score,
+            "protocol": self.protocol,
         }
 
 
@@ -561,15 +670,27 @@ def to_sstp_nodes(rows: Iterable[dict[str, Any]]) -> list[Node]:
 
 
 def dedupe_nodes(nodes: Iterable[Node]) -> list[Node]:
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, str, int]] = set()
     unique: list[Node] = []
     for node in nodes:
-        key = (node.host, node.port)
+        key = (node.protocol, node.host, node.port)
         if key in seen:
             continue
         seen.add(key)
         unique.append(node)
     return unique
+
+
+def interleave(primary: list[Node], secondary: list[Node]) -> list[Node]:
+    """两列表交错合并，保证额外源在小样本截断时也有代表。"""
+    merged: list[Node] = []
+    max_len = max(len(primary), len(secondary))
+    for index in range(max_len):
+        if index < len(primary):
+            merged.append(primary[index])
+        if index < len(secondary):
+            merged.append(secondary[index])
+    return merged
 
 
 def prioritize(nodes: list[Node]) -> list[Node]:
@@ -600,6 +721,12 @@ def classify_network(org: str | None, is_datacenter: bool | None) -> str:
 # ---------------------------------------------------------------------------
 # 检测
 # ---------------------------------------------------------------------------
+def node_link(node: Node) -> str:
+    if node.protocol == "sstp":
+        return f"sstp://vpn:vpn@{node.host}:{node.port}"
+    return f"{node.protocol}://{node.host}:{node.port}"
+
+
 def check_one(
     node: Node,
     session: requests.Session,
@@ -609,8 +736,8 @@ def check_one(
     result: dict[str, Any] = node.to_dict()
     result.update(
         {
-            "protocol": "sstp",
-            "link": f"sstp://vpn:vpn@{node.host}:{node.port}",
+            "protocol": node.protocol,
+            "link": node_link(node),
             "status": "failed",
             "success": False,
             "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -622,7 +749,14 @@ def check_one(
             "residential": "unknown",
         }
     )
-    url = worker_base + quote(f"{node.host}:{node.port}", safe="")
+    if node.protocol == "sstp":
+        url = worker_base + quote(f"{node.host}:{node.port}", safe="")
+    else:
+        parts = urlsplit(worker_base)
+        url = (
+            f"{parts.scheme}://{parts.netloc}{parts.path}?{node.protocol}="
+            + quote(f"{node.host}:{node.port}", safe="")
+        )
     try:
         response = session.get(url, timeout=timeout)
         if response.status_code != 200:
@@ -655,6 +789,10 @@ def check_one(
                 "is_datacenter": exit_info.get("is_datacenter"),
             }
             result["residential"] = classify_network(org, exit_info.get("is_datacenter"))
+            # 额外源没有源站国家标注，用 Worker 实测的出口国家补齐
+            if not (result.get("country_code") or "").strip() and exit_info.get("country_code"):
+                result["country_code"] = str(exit_info["country_code"]).upper()
+                result["country"] = str(exit_info.get("country") or COUNTRY_ZH.get(result["country_code"], ""))
         elif success:
             result["residential"] = "unknown"
         return result
@@ -699,8 +837,8 @@ def check_all(
         stub = node.to_dict()
         stub.update(
             {
-                "protocol": "sstp",
-                "link": f"sstp://vpn:vpn@{node.host}:{node.port}",
+                "protocol": node.protocol,
+                "link": node_link(node),
                 "status": "failed",
                 "success": False,
                 "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -781,6 +919,10 @@ def build_outputs(
     timed_out: int,
 ) -> dict[str, Any]:
     available = [r for r in results if r.get("success")]
+    protocol_counts: dict[str, int] = {}
+    for node in results:
+        proto = str(node.get("protocol") or "sstp")
+        protocol_counts[proto] = protocol_counts.get(proto, 0) + 1
     countries: dict[str, dict[str, Any]] = {}
     for node in available:
         code = (node.get("country_code") or "").upper() or "??"
@@ -810,6 +952,7 @@ def build_outputs(
         "worker_errors": sum(1 for r in results if r.get("worker_error")),
         "timed_out": timed_out,
         "countries": len(countries),
+        "by_protocol": protocol_counts,
         "residential_est": sum(1 for n in available if n.get("residential") == "residential"),
         "datacenter_est": sum(1 for n in available if n.get("residential") == "datacenter"),
         "unknown_est": sum(1 for n in available if n.get("residential") == "unknown"),
@@ -846,7 +989,10 @@ def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -
         chosen = residential[: cfg.max_residential_per_country] + others[: cfg.max_datacenter_per_country]
         counters = {"residential": 0, "datacenter": 0, "unknown": 0}
         for node in chosen:
-            link = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
+            link = node.get("link") or node_link(Node(
+                host=node["host"], port=node["port"], ip="", country="", country_code="",
+                protocol=node.get("protocol") or "sstp",
+            ))
             if link in seen_links:
                 continue
             seen_links.add(link)
@@ -908,6 +1054,7 @@ def write_step_summary(data: dict[str, Any], nodes_count: int, cfg: Config) -> N
         f"| 可用 | {stats['success']} |\n",
         f"| 失败 | {stats['failed']}（Worker 异常 {stats['worker_errors']}）|\n",
         f"| 国家/地区 | {stats['countries']} |\n",
+        f"| 协议分布 | {stats.get('by_protocol', {})} |\n",
         f"| 住宅 / 机房 / 未知 | {stats['residential_est']} / {stats['datacenter_est']} / {stats['unknown_est']} |\n",
         f"| 发布节点行数 | {nodes_count} |\n",
         f"| 用时 | {data['duration_s']}s |\n",
@@ -936,6 +1083,11 @@ def main() -> None:
     session = make_session(pool_size=cfg.concurrency)
     log("CONFIG", f"检测地址: {cfg.worker_base.rsplit('?', 1)[0]}?sstp=***")
     log("CONFIG", f"并发 {cfg.concurrency}, 单节点超时 {cfg.check_timeout}s, 整体截止 {cfg.deadline_s}s")
+    log(
+        "CONFIG",
+        f"额外源: {'开启' if cfg.enable_extra_sources else '关闭'}, "
+        f"{len(cfg.extra_sources)} 个, 上限 {cfg.extra_max_nodes}",
+    )
 
     rows, source = fetch_vpngate(cfg, session)
     raw_count = len(rows)
@@ -947,11 +1099,19 @@ def main() -> None:
     if sstp_count == 0:
         die("VPN GATE", f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点")
 
-    unique_nodes = prioritize(dedupe_nodes(sstp_nodes))
+    extra_nodes, extra_names = fetch_extra_sources(cfg, session)
+    if extra_names:
+        source = source + "+" + "+".join(extra_names)
+
+    vpn_unique = prioritize(dedupe_nodes(sstp_nodes))
+    extra_unique = dedupe_nodes(extra_nodes)
+    unique_nodes = interleave(vpn_unique, extra_unique)
     if cfg.max_check_nodes > 0:
         unique_nodes = unique_nodes[: cfg.max_check_nodes]
+    extra_checked = sum(1 for n in unique_nodes if n.protocol != "sstp")
 
-    log("VPN GATE", f"原始节点 {raw_count}, SSTP {sstp_count}, 去重后 {len(unique_nodes)}")
+    log("VPN GATE", f"原始节点 {raw_count}, SSTP {sstp_count}, 额外源 {len(extra_nodes)}")
+    log("VPN GATE", f"去重合并后 {len(unique_nodes)}（其中额外源 {extra_checked}）")
     log("CLOUDFLARE WORKER", f"提交检测: {len(unique_nodes)}")
 
     check_started = time.time()
