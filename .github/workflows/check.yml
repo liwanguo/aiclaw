@@ -112,6 +112,9 @@ jobs:
           CHECK_TIMEOUT: ${{ github.event.inputs.timeout || '25' }}
           MAX_CHECK_NODES: ${{ github.event.inputs.max_nodes || '0' }}
           MIN_SUCCESS_RATIO: '0'
+          # 只发布 Worker 实测延迟 ≤ 3000ms 的节点（0 = 不限制）。免费后端里慢节点占多数，
+          # 过滤后订阅里留下的都是相对可用线路；想更严可改 2000（数量会更少）。
+          MAX_LATENCY_MS: '3000'
         run: python vpngate.py
 
       - name: Ensure GitHub Pages is enabled

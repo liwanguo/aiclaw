@@ -346,7 +346,9 @@ def test_build_outputs_stats_and_country_grouping():
     assert group["count"] == 2
     assert group["residential"] == 1
     assert group["datacenter"] == 1
-    assert group["nodes"][0]["host"] == "a.opengw.net"
+    # 组内按延迟升序（最快的在最前），住宅标记只作为同延迟时的次序
+    assert group["nodes"][0]["host"] == "b.opengw.net"
+    assert group["nodes"][1]["host"] == "a.opengw.net"
     assert "available" not in data
 
 
@@ -355,3 +357,66 @@ def test_atomic_write_text(tmp_path):
     vpngate.atomic_write_text(str(target), "line1\nline2\n")
     assert target.read_text(encoding="utf-8") == "line1\nline2\n"
     assert list(target.parent.glob("*.tmp-*")) == []
+
+
+def test_build_outputs_prunes_slow_nodes_by_latency():
+    results = [
+        {"host": "a.opengw.net", "port": 443, "success": True, "country": "Japan", "country_code": "JP",
+         "residential": "datacenter", "latency_ms": 300, "worker_error": False},
+        {"host": "b.opengw.net", "port": 443, "success": True, "country": "Japan", "country_code": "JP",
+         "residential": "datacenter", "latency_ms": 5000, "worker_error": False},
+        {"host": "c.opengw.net", "port": 443, "success": True, "country": "Japan", "country_code": "JP",
+         "residential": "datacenter", "latency_ms": None, "worker_error": False},
+    ]
+    data = vpngate.build_outputs(
+        results=results,
+        raw_count=3,
+        sstp_count=3,
+        source="test",
+        worker_host="worker.example.com",
+        duration_s=1.0,
+        timed_out=0,
+        max_latency_ms=1000,
+    )
+    # 延迟未知的节点保留，超阈值的剔除，且不计入 failed
+    assert data["stats"]["success"] == 2
+    assert data["stats"]["pruned_slow"] == 1
+    assert data["stats"]["failed"] == 0
+    hosts = sorted(n["host"] for n in data["countries"]["JP"]["nodes"])
+    assert hosts == ["a.opengw.net", "c.opengw.net"]
+
+
+def test_build_outputs_latency_prune_never_empties_result():
+    results = [
+        {"host": "a.opengw.net", "port": 443, "success": True, "country": "Japan", "country_code": "JP",
+         "residential": "datacenter", "latency_ms": 9000, "worker_error": False},
+    ]
+    data = vpngate.build_outputs(
+        results=results,
+        raw_count=1,
+        sstp_count=1,
+        source="test",
+        worker_host="worker.example.com",
+        duration_s=1.0,
+        timed_out=0,
+        max_latency_ms=500,
+    )
+    # 阈值过严时退回不筛，订阅不会被清空
+    assert data["stats"]["success"] == 1
+    assert data["stats"]["pruned_slow"] == 0
+
+
+def test_build_nodes_text_orders_countries_by_best_latency():
+    data = {
+        "countries": {
+            "AA": {"code": "AA", "name": "A", "nodes": [
+                {"host": "slow.opengw.net", "port": 443, "residential": "unknown", "latency_ms": 900},
+            ]},
+            "BB": {"code": "BB", "name": "B", "nodes": [
+                {"host": "fast.opengw.net", "port": 443, "residential": "unknown", "latency_ms": 100},
+            ]},
+        }
+    }
+    text = vpngate.build_nodes_text(data, ["e.example.com:443"], make_config())
+    first = text.strip().splitlines()[0]
+    assert "fast.opengw.net" in first

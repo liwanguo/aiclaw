@@ -361,6 +361,9 @@ class Config:
     extra_max_nodes: int = 120
     # 要从结果里剔除的出口国家/地区代码（默认排除中国大陆，见 DEFAULT_EXCLUDE_COUNTRIES）
     exclude_country_codes: frozenset[str] = DEFAULT_EXCLUDE_COUNTRIES
+    # 只发布 Worker 实测往返不超过该毫秒数的节点（0 = 不限制）。
+    # 免费/公共后端里慢节点占多数，砍掉高延迟节点是提升客户端体感最直接的手段。
+    max_latency_ms: int = 0
 
     @classmethod
     def load(cls) -> "Config":
@@ -403,6 +406,7 @@ class Config:
             enable_extra_sources=enable_extra,
             extra_sources=extra_sources,
             extra_max_nodes=_env_int("EXTRA_MAX_NODES", 120),
+            max_latency_ms=_env_int("MAX_LATENCY_MS", 0),
             exclude_country_codes=parse_exclude_countries(os.environ.get("EXCLUDE_COUNTRIES")),
         )
 
@@ -938,12 +942,26 @@ def build_outputs(
     duration_s: float,
     timed_out: int,
     exclude_country_codes: frozenset[str] = frozenset(),
+    max_latency_ms: int = 0,
 ) -> dict[str, Any]:
     def _code(item: dict[str, Any]) -> str:
         return str(item.get("country_code") or "").upper()
 
     available = [r for r in results if r.get("success") and _code(r) not in exclude_country_codes]
     excluded = sum(1 for r in results if r.get("success") and _code(r) in exclude_country_codes)
+    # 延迟阈值过滤：Worker 实测往返超过 max_latency_ms 的节点不发布。
+    # 延迟未知（None）的节点保留，避免把“测不出耗时但可用”的节点误杀。
+    pruned_slow = 0
+    if max_latency_ms > 0:
+        kept = [
+            r
+            for r in available
+            if r.get("latency_ms") is None or float(r["latency_ms"]) <= max_latency_ms
+        ]
+        # 兜底：阈值过严导致一个都不剩时退回不筛，避免把订阅清空。
+        if kept:
+            pruned_slow = len(available) - len(kept)
+            available = kept
     protocol_counts: dict[str, int] = {}
     for node in results:
         proto = str(node.get("protocol") or "sstp")
@@ -965,7 +983,7 @@ def build_outputs(
         group["datacenter"] = sum(1 for n in group["nodes"] if n.get("residential") == "datacenter")
         group["unknown"] = group["count"] - group["residential"] - group["datacenter"]
         group["nodes"].sort(
-            key=lambda n: (n.get("residential") != "residential", n.get("latency_ms") is None, n.get("latency_ms") or 0)
+            key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("residential") != "residential")
         )
 
     stats = {
@@ -974,7 +992,9 @@ def build_outputs(
         "checked": len(results),
         "success": len(available),
         "excluded": excluded,
-        "failed": len(results) - len(available) - excluded,
+        "pruned_slow": pruned_slow,
+        "max_latency_ms": max_latency_ms,
+        "failed": len(results) - len(available) - excluded - pruned_slow,
         "worker_errors": sum(1 for r in results if r.get("worker_error")),
         "timed_out": timed_out,
         "countries": len(countries),
@@ -1000,15 +1020,24 @@ def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -
     lines: list[str] = []
     seen_links: set[str] = set()
     index = 0
+    def _best_latency(group: dict[str, Any]) -> float:
+        values = [n.get("latency_ms") for n in group.get("nodes", []) if n.get("latency_ms") is not None]
+        return min(values) if values else float("inf")
+
+    # 按“该国最快节点的延迟”排序：客户端默认选中第一条，就是整订阅里最快的线路。
     ordered = sorted(
         data["countries"].items(),
-        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
+        key=lambda kv: (
+            _best_latency(kv[1]),
+            -int(kv[1].get("count") or 0),
+            str(kv[1].get("code") or kv[0]),
+        ),
     )
     for code, group in ordered:
         name = COUNTRY_ZH.get(code) or group.get("name") or code
         nodes = sorted(
             group["nodes"],
-            key=lambda n: (n.get("residential") != "residential", n.get("latency_ms") is None, n.get("latency_ms") or 0),
+            key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("residential") != "residential"),
         )
         residential = [n for n in nodes if n.get("residential") == "residential"]
         others = [n for n in nodes if n.get("residential") != "residential"]
@@ -1079,6 +1108,7 @@ def write_step_summary(data: dict[str, Any], nodes_count: int, cfg: Config) -> N
         f"| 已检测 | {stats['checked']} |\n",
         f"| 可用 | {stats['success']} |\n",
         f"| 失败 | {stats['failed']}（Worker 异常 {stats['worker_errors']}）|\n",
+        f"| 延迟过滤 | 剔除 {stats.get('pruned_slow', 0)} 个（阈值 {stats.get('max_latency_ms') or '不限'} ms）|\n",
         f"| 国家/地区 | {stats['countries']} |\n",
         f"| 协议分布 | {stats.get('by_protocol', {})} |\n",
         f"| 住宅 / 机房 / 未知 | {stats['residential_est']} / {stats['datacenter_est']} / {stats['unknown_est']} |\n",
@@ -1176,6 +1206,7 @@ def main() -> None:
         duration_s=time.time() - started,
         timed_out=timed_out,
         exclude_country_codes=cfg.exclude_country_codes,
+        max_latency_ms=cfg.max_latency_ms,
     )
 
     if data["stats"]["excluded"]:
@@ -1184,8 +1215,14 @@ def main() -> None:
             f"已剔除 {data['stats']['excluded']} 个节点"
             f"（出口国家/地区: {','.join(sorted(cfg.exclude_country_codes)) or '-'}）",
         )
+    if data["stats"].get("pruned_slow"):
+        log(
+            "RESULT",
+            f"延迟阈值过滤：剔除 {data['stats']['pruned_slow']} 个慢节点"
+            f"（Worker 实测 > {data['stats']['max_latency_ms']}ms）",
+        )
     if data["stats"]["success"] == 0:
-        die("RESULT", "剔除指定国家/地区后没有可用节点，本次不发布（保留上一次产物）")
+        die("RESULT", "按规则过滤后没有可用节点，本次不发布（保留上一次产物）")
 
     edge_hosts = get_combined_edge_hosts(cfg, session)
     data_path, html_path, nodes_path, nodes_text = write_outputs(data, cfg, edge_hosts)
